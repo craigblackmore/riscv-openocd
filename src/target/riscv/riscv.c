@@ -1201,6 +1201,43 @@ int riscv_openocd_halt(struct target *target)
 	return out;
 }
 
+/* disable all triggers, step, enable all triggers */
+int riscv_strict_step(struct target *target)
+{
+	struct watchpoint *watchpoint = target->watchpoints;
+	bool trigger_temporarily_cleared[RISCV_MAX_HWBPS] = {0};
+
+	int i = 0;
+	int result = ERROR_OK;
+	while (watchpoint && result == ERROR_OK) {
+		LOG_DEBUG("watchpoint %d: set=%d", i, watchpoint->set);
+		trigger_temporarily_cleared[i] = watchpoint->set;
+		if (watchpoint->set)
+			result = riscv_remove_watchpoint(target, watchpoint);
+		watchpoint = watchpoint->next;
+		i++;
+	}
+
+	if (result == ERROR_OK)
+		result = riscv_step_rtos_hart(target);
+
+	watchpoint = target->watchpoints;
+	i = 0;
+	while (watchpoint) {
+		LOG_DEBUG("watchpoint %d: cleared=%d", i, trigger_temporarily_cleared[i]);
+		if (trigger_temporarily_cleared[i]) {
+			if (result == ERROR_OK)
+				result = riscv_add_watchpoint(target, watchpoint);
+			else
+				riscv_add_watchpoint(target, watchpoint);
+		}
+		watchpoint = watchpoint->next;
+		i++;
+	}
+
+	return result;
+}
+
 int riscv_openocd_resume(
 		struct target *target,
 		int current,
@@ -1213,54 +1250,26 @@ int riscv_openocd_resume(
 	if (!current)
 		riscv_set_register(target, GDB_REGNO_PC, address);
 
+	int result;
 	if (target->debug_reason == DBG_REASON_WATCHPOINT) {
-		/* To be able to run off a trigger, disable all the triggers, step, and
-		 * then resume as usual. */
-		struct watchpoint *watchpoint = target->watchpoints;
-		bool trigger_temporarily_cleared[RISCV_MAX_HWBPS] = {0};
-
-		int i = 0;
-		int result = ERROR_OK;
-		while (watchpoint && result == ERROR_OK) {
-			LOG_DEBUG("watchpoint %d: set=%d", i, watchpoint->set);
-			trigger_temporarily_cleared[i] = watchpoint->set;
-			if (watchpoint->set)
-				result = riscv_remove_watchpoint(target, watchpoint);
-			watchpoint = watchpoint->next;
-			i++;
-		}
-
-		if (result == ERROR_OK)
-			result = riscv_step_rtos_hart(target);
-
-		watchpoint = target->watchpoints;
-		i = 0;
-		while (watchpoint) {
-			LOG_DEBUG("watchpoint %d: cleared=%d", i, trigger_temporarily_cleared[i]);
-			if (trigger_temporarily_cleared[i]) {
-				if (result == ERROR_OK)
-					result = riscv_add_watchpoint(target, watchpoint);
-				else
-					riscv_add_watchpoint(target, watchpoint);
-			}
-			watchpoint = watchpoint->next;
-			i++;
-		}
+		/* To be able to run off a trigger, disable all the triggers, step, re-enable
+		 * triggers then resume as usual. */
+		result = riscv_strict_step(target);
 
 		if (result != ERROR_OK)
 			return result;
 	}
 
-	int out = riscv_resume_all_harts(target);
-	if (out != ERROR_OK) {
+	result = riscv_resume_all_harts(target);
+	if (result != ERROR_OK) {
 		LOG_ERROR("unable to resume all harts");
-		return out;
+		return result;
 	}
 
 	register_cache_invalidate(target->reg_cache);
 	target->state = TARGET_RUNNING;
 	target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
-	return out;
+	return result;
 }
 
 int riscv_openocd_step(
@@ -1274,10 +1283,17 @@ int riscv_openocd_step(
 	if (!current)
 		riscv_set_register(target, GDB_REGNO_PC, address);
 
-	int out = riscv_step_rtos_hart(target);
-	if (out != ERROR_OK) {
+	int result;
+	if (target->debug_reason == DBG_REASON_WATCHPOINT)
+		/* To be able to step over a trigger, disable all the triggers, step, then
+		 * re-enable triggers. */
+		result = riscv_strict_step(target);
+	else
+		result = riscv_step_rtos_hart(target);
+
+	if (result != ERROR_OK) {
 		LOG_ERROR("unable to step rtos hart");
-		return out;
+		return result;
 	}
 
 	register_cache_invalidate(target->reg_cache);
@@ -1286,7 +1302,7 @@ int riscv_openocd_step(
 	target->state = TARGET_HALTED;
 	target->debug_reason = DBG_REASON_SINGLESTEP;
 	target_call_event_callbacks(target, TARGET_EVENT_HALTED);
-	return out;
+	return result;
 }
 
 /* Command Handlers */
